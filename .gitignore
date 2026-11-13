@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+models/cache/
+models/value_gen*.npz
+traces/
+*.jsonl
+# never commit a seat token
+.env
+token*.txt

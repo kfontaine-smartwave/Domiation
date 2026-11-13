@@ -1,0 +1,253 @@
+"""Play a DOM-IA-TION game with the NPU-backed agent.
+
+    python -m domination.play --jeton <seat token>
+
+The token comes from the game lobby (seat set to "Mon script Python" / "Script externe"); it can
+also be given through the IA_JETON environment variable so that it stays out of the shell history.
+The agent waits for its turn, plays it order by order (it re-reads the board after every battle)
+and stops by itself when the game is over or when the token is revoked.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+import urllib.error
+
+import numpy as np
+
+from .board import state_from_view
+from .client import DEFAULT_URL, ApiError, Client
+from .evaluators import load_best_evaluator, sigmoid
+from .features import extract
+from .policy import SearchAgent, SearchConfig
+
+SAFETY_SECONDS = 15        # stop attacking when the turn clock gets this low
+
+
+class Player:
+    def __init__(self, client: Client, agent: SearchAgent, log=print, trace=None):
+        self.client, self.agent, self.log, self.trace = client, agent, log, trace
+        self.topo = None
+        self.turns = 0
+        self.deployed = False
+
+    # ------------------------------------------------------------------ helpers
+    def _state(self, view):
+        s = state_from_view(view, self.topo)
+        self.topo = s.topo
+        return s
+
+    def _act(self, action: str, **fields) -> dict:
+        view = self.client.act(action, **fields)
+        if self.trace:
+            self.trace.write(json.dumps({"t": time.time(), "order": {"action": action, **fields},
+                                         "view": view}, ensure_ascii=False) + "\n")
+        return view
+
+    def _value(self, s) -> float:
+        feats, terminal = extract(s.topo, s.owner[None], s.armies[None], s.me, s.n_players,
+                                  s.turn_frac, s.pending, s.income_div, s.revolt)
+        return float(sigmoid(self.agent.evaluator.logits(feats)[0])) if np.isnan(terminal[0]) else float(terminal[0])
+
+    # ------------------------------------------------------------------ one turn
+    def play_turn(self, view: dict) -> dict:
+        """Plays from whatever phase the turn is in (so an interrupted turn can be resumed)."""
+        ids = None
+        started = time.time()
+        budget = float(view.get("delai_restant") or 120)
+        notes = {"placed": [], "attacks": 0, "conquests": 0, "fortify": None}
+        me = view["vous"]
+        before = view["partie"]["joueurs"][me]["stats"]["territoires"]
+
+        def mine(v):
+            return v["partie"]["joueurs"][me]["stats"]["territoires"]
+
+        def running(v):
+            g = v["partie"]
+            return v.get("mon_tour") and not g["termine"] and g["courant"] == me
+
+        if running(view) and view["partie"]["phase"] == "renfort":
+            s = self._state(view)
+            ids = s.topo.ids
+            remaining = int(view["partie"]["renforts_restants"])
+            for cell, nb in self.agent.place(s, remaining):
+                nb = min(int(nb), remaining)
+                if nb > 0:
+                    view = self._act("renfort", territoire=ids[cell], nb=nb)
+                    notes["placed"].append(f"+{nb} {ids[cell]}")
+                    remaining = int(view["partie"]["renforts_restants"])
+            if remaining > 0:                          # every reinforcement must be placed before moving on
+                s = self._state(view)
+                cells = s.cells_of(s.me)
+                cell = int(cells[np.argmax(s.armies[cells])])
+                view = self._act("renfort", territoire=ids[cell], nb=remaining)
+                notes["placed"].append(f"+{remaining} {ids[cell]}")
+            view = self._act("passer")
+
+        if running(view) and view["partie"]["phase"] == "attaque":
+            for _ in range(self.agent.cfg.max_attacks):
+                if budget - (time.time() - started) < SAFETY_SECONDS:
+                    self.log("  clock running low: ending the attack phase")
+                    break
+                s = self._state(view)
+                ids = s.topo.ids
+                choice = self.agent.choose_attack(s)
+                if choice is None:
+                    break
+                src, dst, occupation = choice
+                held = mine(view)
+                try:
+                    view = self._act("attaque", source=ids[src], cible=ids[dst], blitz=True, occupation=occupation)
+                except ApiError as exc:
+                    if exc.fatal or exc.code != 400:
+                        raise
+                    self.log(f"  order refused ({exc.message}): ending the attack phase")
+                    view = self.client.state()
+                    break
+                notes["attacks"] += 1
+                notes["conquests"] += mine(view) > held
+                if not running(view):
+                    break
+            if running(view) and view["partie"]["phase"] == "attaque":
+                view = self._act("passer")
+
+        if running(view) and view["partie"]["phase"] == "fortification":
+            s = self._state(view)
+            ids = s.topo.ids
+            move = self.agent.choose_fortify(s)
+            done = False
+            if move is not None:
+                src, dst, nb = move
+                try:
+                    view = self._act("fortification", source=ids[src], cible=ids[dst], nb=int(nb))
+                    notes["fortify"] = f"{ids[src]}->{ids[dst]} ({nb})"
+                    done = True
+                except ApiError as exc:
+                    if exc.fatal or exc.code != 400:
+                        raise
+                    self.log(f"  fortification refused ({exc.message})")
+            if not done:
+                view = self._act("passer")
+
+        self.turns += 1
+        s = self._state(view)
+        notes.update(view=view, before=before, after=mine(view), value=self._value(s),
+                     seconds=time.time() - started)
+        return notes
+
+    def _deploy(self, view: dict) -> None:
+        """Secret initial placement of the "Conquête planétaire" mode: every player spreads a
+        reserve over its territories before the first turn. The reserve is placed in three
+        waves chosen by the search; whatever is left is spread by the server itself."""
+        self.deployed = True
+        info = view["partie"].get("deploiement") or {}
+        reserve = int(info.get("reserve") or 0)
+        if info.get("valide") or reserve <= 0 or info.get("siege") not in (None, view["vous"]):
+            return
+        try:
+            placed = []
+            for wave in range(3):
+                s = self._state(view)
+                nb = reserve if wave == 2 else max(1, reserve // (3 - wave))
+                for cell, k in self.agent.place(s, nb):
+                    view = self._act("deployer", territoire=s.topo.ids[cell], nb=int(k))
+                    placed.append(f"+{k} {s.topo.ids[cell]}")
+                    reserve -= int(k)
+                if reserve <= 0:
+                    break
+            self._act("valider_deploiement")
+            self.log(f"initial placement: {', '.join(placed)}")
+        except ApiError as exc:
+            if exc.fatal:
+                raise
+            self.log(f"initial placement left to the server ({exc.message or exc.code})")
+
+    # ------------------------------------------------------------------ main loop
+    def run(self, max_turns: int | None = None) -> str | None:
+        failures = 0
+        while True:
+            try:
+                view = self.client.wait()
+                failures = 0
+                game = view["partie"]
+                if game["termine"]:
+                    winner = game.get("vainqueur")
+                    name = game["joueurs"][winner]["nom"] if winner else "nobody (draw)"
+                    result = "WON" if winner == view["vous"] else ("draw" if not winner else "lost")
+                    self.log(f"Game over: {result}. Winner: {name}. {game.get('raison') or ''}".rstrip())
+                    return result
+                if game.get("deploiement") and not self.deployed:
+                    self._deploy(view)
+                    continue
+                if not view.get("mon_tour"):
+                    continue
+                turn = game["tour"]
+                notes = self.play_turn(view)
+            except ApiError as exc:
+                if exc.fatal:
+                    self.log(f"Stopping: {exc.message or exc}")
+                    return None
+                if exc.code == 400:                    # e.g. the turn timed out under our feet
+                    self.log(f"  order refused ({exc.message}); re-reading the game")
+                    time.sleep(1)
+                    continue
+                failures += 1
+                self._pause(failures, f"server unavailable ({exc})")
+                continue
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                failures += 1
+                self._pause(failures, f"network unavailable ({type(exc).__name__})")
+                continue
+            ev = self.agent.evaluator
+            usage = f" | {ev.device}: {ev.positions} positions, {ev.seconds:.2f} s" if hasattr(ev, "positions") else ""
+            if hasattr(ev, "positions"):
+                ev.positions, ev.seconds = 0, 0.0
+            self.log(f"turn {turn}: {', '.join(notes['placed']) or 'no reinforcement'}; "
+                     f"{notes['attacks']} attacks, {notes['conquests']} conquests; "
+                     f"fortify {notes['fortify'] or '-'} | territories {notes['before']} -> {notes['after']} | "
+                     f"win estimate {notes['value'] * 100:.0f} % | {notes['seconds']:.1f} s{usage}")
+            if max_turns and self.turns >= max_turns:
+                return None
+
+    def _pause(self, failures: int, reason: str):
+        delay = min(60, 5 * 2 ** min(failures - 1, 4))
+        self.log(f"{reason}; retrying in {delay} s")
+        time.sleep(delay)
+
+
+def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--jeton", "--token", dest="token", default=os.environ.get("IA_JETON"),
+                    help="seat token (or environment variable IA_JETON)")
+    ap.add_argument("--url", default=os.environ.get("IA_URL", DEFAULT_URL))
+    ap.add_argument("--device", default="NPU", help="OpenVINO device for the value network (NPU, GPU, CPU)")
+    ap.add_argument("--tours", "--turns", dest="turns", type=int, default=None, help="stop after N turns")
+    ap.add_argument("--depth", type=int, default=2, help="conquest chains explored after each attack")
+    ap.add_argument("--trace", help="write every order and server reply to this JSONL file")
+    a = ap.parse_args(argv)
+    if not a.token:
+        ap.error("missing token: --jeton <token> or environment variable IA_JETON")
+    evaluator = load_best_evaluator(a.device)
+    print(f"Evaluator: {evaluator.name}")
+    agent = SearchAgent(evaluator, SearchConfig(depth=a.depth))
+    trace = open(a.trace, "a", encoding="utf-8") if a.trace else None
+    print("Connected. Waiting for my turn...")
+    try:
+        Player(Client(a.url, a.token), agent, trace=trace).run(a.turns)
+    except KeyboardInterrupt:
+        print("Interrupted.")
+    finally:
+        if trace:
+            trace.close()
+
+
+if __name__ == "__main__":
+    main()
