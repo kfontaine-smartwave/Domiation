@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .battle import simulate_blitz
+from .battle import expected_blitz, simulate_blitz
 from .board import NEUTRAL, State, Topology
 from .features import extract
 
@@ -72,7 +72,7 @@ def random_setup(rng, n_players: int | None = None, size: tuple | None = None):
     if size is None:
         size = [(10, 7), (10, 7), (10, 7), (10, 7), (10, 7), (8, 6), (12, 8), (14, 10)][int(rng.integers(8))]
     if n_players is None:
-        n_players = int(rng.choice([2, 2, 2, 2, 2, 2, 3, 4]))
+        n_players = int(rng.choice([2, 3, 4], p=[0.4, 0.35, 0.25]))
     width, height = size
     cells = grid_cells(width, height, oval=rng.random() < 0.8)
     pos = {c: i for i, c in enumerate(cells)}
@@ -127,6 +127,8 @@ def random_setup(rng, n_players: int | None = None, size: tuple | None = None):
 
 
 class Game:
+    expected = False        # True: battles resolve to their expected outcome instead of dice
+
     def __init__(self, topo, owner, armies, n_players, rng, turn_max: int = 150, income_div: int = 3,
                  revolt=(True, 0.5, 0.1), quests: bool = True):
         self.topo = topo
@@ -148,7 +150,17 @@ class Game:
 
     def state(self, player: int) -> State:
         return State(self.topo, self.owner, self.armies, self.n_players, player, self.turn, self.turn_max,
-                     self.income_div, self.pending[player], self.mission[player], self.revolt)
+                     self.income_div, self.pending[player], self.mission[player], self.revolt, order=self.order)
+
+    @classmethod
+    def from_state(cls, s: State, rng) -> "Game":
+        """A simulated continuation of a real position (used by the look-ahead simulations)."""
+        g = cls(s.topo, s.owner, s.armies, s.n_players, rng, s.turn_max, s.income_div, s.revolt, quests=False)
+        g.turn = s.turn
+        g.order = list(s.order) or list(range(s.n_players))
+        g.pending[s.me] = s.pending
+        g.mission[s.me] = s.mission
+        return g
 
     def alive(self) -> list[int]:
         return [q for q in range(self.n_players) if (self.owner == q).any()]
@@ -163,6 +175,11 @@ class Game:
             self.mission[q] = (t, 6.0 if (self.owner[t] >= 0 or self.armies[t] >= 5) else 3.0)
 
     def play_turn(self, q: int, agent, record: bool = True):
+        self.begin_turn(q, agent)
+        self.finish_turn(q, agent, "attack", record)
+
+    def begin_turn(self, q: int, agent):
+        """Income, quest hand-out and reinforcement phase."""
         s = self.state(q)
         income = s.income(q) + int(self.pending[q])
         self.pending[q] = 0.0
@@ -178,29 +195,47 @@ class Game:
         if placed < income:                                 # the server requires every army to be placed
             mine = np.flatnonzero(self.owner == q)
             self.armies[int(mine[np.argmax(self.armies[mine])])] += income - placed
-        for _ in range(getattr(getattr(agent, "cfg", None), "max_attacks", 60)):
-            s = self.state(q)
-            choice = agent.choose_attack(s)
-            if choice is None:
-                break
-            src, dst, occupation = choice
-            if self.owner[src] != q or self.owner[dst] == q or self.armies[src] < 2 or dst not in self.topo.nbrs[src]:
-                break
-            self.stats["attacks"] += 1
-            left, remaining, dice = simulate_blitz(int(self.armies[src]), int(self.armies[dst]), self.rng)
-            if remaining == 0:
-                moved = left - 1 if occupation == "max" else min(dice, left - 1)
-                self.owner[dst] = q
-                self.armies[dst] = moved
-                self.armies[src] = left - moved
-                self.conquered[dst] = True
-                if self.mission[q] is not None and self.mission[q][0] == dst:
-                    self.pending[q] += self.mission[q][1]
-                    self.mission[q] = None
-                if len(self.alive()) == 1:
+
+    def attack(self, q: int, src: int, dst: int, occupation: str) -> bool:
+        """Resolves one blitz. Returns True on conquest. With `expected` set, the dice are replaced
+        by the most likely result with average losses (noise-free look-ahead)."""
+        if self.expected:
+            p, exp_att, exp_def = expected_blitz(int(self.armies[src]), int(self.armies[dst]))
+            if p < 0.5:
+                self.armies[src], self.armies[dst] = 1, max(1, int(round(exp_def)))
+                return False
+            left = max(2, int(round(exp_att)))
+            self.conquer(q, src, dst, left, left - 1 if occupation == "max" else min(3, left - 1))
+            return True
+        left, remaining, dice = simulate_blitz(int(self.armies[src]), int(self.armies[dst]), self.rng)
+        if remaining:
+            self.armies[src], self.armies[dst] = left, remaining
+            return False
+        self.conquer(q, src, dst, left, left - 1 if occupation == "max" else min(dice, left - 1))
+        return True
+
+    def conquer(self, q: int, src: int, dst: int, left: int, moved: int):
+        self.owner[dst] = q
+        self.armies[dst] = moved
+        self.armies[src] = left - moved
+        self.conquered[dst] = True
+        if self.mission[q] is not None and self.mission[q][0] == dst:
+            self.pending[q] += self.mission[q][1]
+            self.mission[q] = None
+
+    def finish_turn(self, q: int, agent, phase: str = "attack", record: bool = False):
+        """Plays the rest of a turn from `phase` ("attack" or "fortify")."""
+        if phase == "attack":
+            for _ in range(getattr(getattr(agent, "cfg", None), "max_attacks", 60)):
+                choice = agent.choose_attack(self.state(q))
+                if choice is None:
                     break
-            else:
-                self.armies[src], self.armies[dst] = left, remaining
+                src, dst, occupation = choice
+                if self.owner[src] != q or self.owner[dst] == q or self.armies[src] < 2 or dst not in self.topo.nbrs[src]:
+                    break
+                self.stats["attacks"] += 1
+                if self.attack(q, src, dst, occupation) and len(self.alive()) == 1:
+                    break
         if len(self.alive()) > 1:
             move = agent.choose_fortify(self.state(q))
             if move is not None:

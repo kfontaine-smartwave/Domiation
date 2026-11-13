@@ -61,13 +61,14 @@ class MLPEvaluator:
     def __init__(self, weights=DEFAULT_WEIGHTS):
         data = np.load(weights) if not isinstance(weights, dict) else weights
         self.mean = data["mean"].astype(np.float32)
+        self.n_in = len(self.mean)                 # older networks read only the first features
         self.inv_std = (1.0 / data["std"]).astype(np.float32)
         n_layers = sum(1 for k in data.keys() if k.startswith("W"))
         self.layers = [(data[f"W{i}"].astype(np.float32), data[f"b{i}"].astype(np.float32))
                        for i in range(n_layers)]
 
     def logits(self, feats: np.ndarray) -> np.ndarray:
-        h = (feats - self.mean) * self.inv_std
+        h = (feats[:, :self.n_in] - self.mean) * self.inv_std
         for i, (w, b) in enumerate(self.layers):
             h = h @ w + b
             if i < len(self.layers) - 1:
@@ -83,7 +84,7 @@ def export_openvino(weights=DEFAULT_WEIGHTS, xml_path=DEFAULT_IR, batch: int = N
 
     data = np.load(weights)
     n_layers = sum(1 for k in data.keys() if k.startswith("W"))
-    x = ops.parameter([batch, N_FEATURES], np.float32, name="features")
+    x = ops.parameter([batch, len(data["mean"])], np.float32, name="features")
     h = ops.multiply(ops.subtract(x, ops.constant(data["mean"].astype(np.float32).reshape(1, -1))),
                      ops.constant((1.0 / data["std"]).astype(np.float32).reshape(1, -1)))
     for i in range(n_layers):
@@ -129,8 +130,9 @@ class OpenVINOEvaluator:
             raise RuntimeError("no OpenVINO device could load the model: " + "; ".join(errors))
         self.fallback_reason = "; ".join(errors) if self.device != device else ""
         self.batch = int(self.compiled.input(0).shape[0])
+        self.n_in = int(self.compiled.input(0).shape[1])
         self.request = self.compiled.create_infer_request()
-        self._buf = np.zeros((self.batch, N_FEATURES), dtype=np.float32)
+        self._buf = np.zeros((self.batch, self.n_in), dtype=np.float32)
         self.name = f"value network on {self.device} ({self.device_name}) via OpenVINO"
         self.calls = 0
         self.positions = 0
@@ -141,7 +143,7 @@ class OpenVINOEvaluator:
         out = np.empty(n, dtype=np.float32)
         t0 = time.perf_counter()
         for start in range(0, n, self.batch):
-            chunk = feats[start:start + self.batch]
+            chunk = feats[start:start + self.batch, :self.n_in]
             self._buf[:len(chunk)] = chunk
             self._buf[len(chunk):] = 0.0
             res = self.request.infer({0: self._buf})

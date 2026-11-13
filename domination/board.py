@@ -50,6 +50,7 @@ class State:
     revolt: tuple = (True, 0.5, 0.1)   # (active, share-of-map threshold, chance per weak cell)
     objective: tuple | None = None     # (regions needed, territories needed) in "objectifs" mode
     names: list = field(default_factory=list)   # server keys of the players ("j1", ...)
+    order: list = field(default_factory=list)   # players in turn order (indices); empty = 0..P-1
 
     def copy(self) -> "State":
         return replace(self, owner=self.owner.copy(), armies=self.armies.copy())
@@ -96,6 +97,7 @@ def state_from_view(view: dict, topo: Topology | None = None) -> State:
     me = number[view["vous"]]
     state = State(topo, owner, armies, len(names), me, turn=int(game.get("tour") or 1),
                   turn_max=int(game.get("tour_max") or 150), names=names)
+    state.order = [number[k] for k in (game.get("ordre") or names) if k in number]
     state.income_div = _infer_income_divisor(game, names, owner)
     mission = game.get("mission")
     if mission and mission.get("territoire") in topo.index:

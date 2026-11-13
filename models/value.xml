@@ -67,11 +67,11 @@
 			</output>
 		</layer>
 		<layer id="5" name="Constant_9" type="Const" version="opset1">
-			<data element_type="f32" shape="34, 96" offset="272" size="13056" />
+			<data element_type="f32" shape="34, 64" offset="272" size="8704" />
 			<output>
 				<port id="0" precision="FP32">
 					<dim>34</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
@@ -84,22 +84,22 @@
 				</port>
 				<port id="1" precision="FP32">
 					<dim>34</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</input>
 			<output>
 				<port id="2" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
 		<layer id="7" name="Constant_12" type="Const" version="opset1">
-			<data element_type="f32" shape="1, 96" offset="13328" size="384" />
+			<data element_type="f32" shape="1, 64" offset="8976" size="256" />
 			<output>
 				<port id="0" precision="FP32">
 					<dim>1</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
@@ -108,17 +108,17 @@
 			<input>
 				<port id="0" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 				<port id="1" precision="FP32">
 					<dim>1</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</input>
 			<output>
 				<port id="2" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
@@ -126,22 +126,22 @@
 			<input>
 				<port id="0" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</input>
 			<output>
 				<port id="1" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
 		<layer id="10" name="Constant_16" type="Const" version="opset1">
-			<data element_type="f32" shape="96, 96" offset="13712" size="36864" />
+			<data element_type="f32" shape="64, 64" offset="9232" size="16384" />
 			<output>
 				<port id="0" precision="FP32">
-					<dim>96</dim>
-					<dim>96</dim>
+					<dim>64</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
@@ -150,26 +150,26 @@
 			<input>
 				<port id="0" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 				<port id="1" precision="FP32">
-					<dim>96</dim>
-					<dim>96</dim>
+					<dim>64</dim>
+					<dim>64</dim>
 				</port>
 			</input>
 			<output>
 				<port id="2" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
 		<layer id="12" name="Constant_19" type="Const" version="opset1">
-			<data element_type="f32" shape="1, 96" offset="50576" size="384" />
+			<data element_type="f32" shape="1, 64" offset="25616" size="256" />
 			<output>
 				<port id="0" precision="FP32">
 					<dim>1</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
@@ -178,17 +178,17 @@
 			<input>
 				<port id="0" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 				<port id="1" precision="FP32">
 					<dim>1</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</input>
 			<output>
 				<port id="2" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
@@ -196,21 +196,21 @@
 			<input>
 				<port id="0" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</input>
 			<output>
 				<port id="1" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 			</output>
 		</layer>
 		<layer id="15" name="Constant_23" type="Const" version="opset1">
-			<data element_type="f32" shape="96, 1" offset="50960" size="384" />
+			<data element_type="f32" shape="64, 1" offset="25872" size="256" />
 			<output>
 				<port id="0" precision="FP32">
-					<dim>96</dim>
+					<dim>64</dim>
 					<dim>1</dim>
 				</port>
 			</output>
@@ -220,10 +220,10 @@
 			<input>
 				<port id="0" precision="FP32">
 					<dim>256</dim>
-					<dim>96</dim>
+					<dim>64</dim>
 				</port>
 				<port id="1" precision="FP32">
-					<dim>96</dim>
+					<dim>64</dim>
 					<dim>1</dim>
 				</port>
 			</input>
@@ -235,7 +235,7 @@
 			</output>
 		</layer>
 		<layer id="17" name="Constant_26" type="Const" version="opset1">
-			<data element_type="f32" shape="1, 1" offset="51344" size="4" />
+			<data element_type="f32" shape="1, 1" offset="26128" size="4" />
 			<output>
 				<port id="0" precision="FP32">
 					<dim>1</dim>

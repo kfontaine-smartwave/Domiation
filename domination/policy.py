@@ -155,14 +155,15 @@ class SearchAgent:
         return int(np.argmax(scores))
 
     # ------------------------------------------------------------------ reinforcements
-    def place(self, s: State, n: int) -> list[tuple[int, int]]:
-        if n <= 0:
-            return []
+    def place_options(self, s: State, n: int) -> list[tuple[list, float]]:
+        """Reinforcement plans [(cell, armies), ...] with their estimated value, best first."""
         topo, me = s.topo, s.me
         mine = s.cells_of(me)
+        if n <= 0 or not len(mine):
+            return []
         border = [int(c) for c in mine if any(s.owner[t] != me for t in topo.nbrs[c])]
         if not border:
-            return [(int(mine[np.argmax(s.armies[mine])]), n)] if len(mine) else []
+            return [([(int(mine[np.argmax(s.armies[mine])]), n)], 0.5)]
         if len(border) > self.cfg.max_place:
             border = self._shortlist(s, border, n)
         tree = _Tree(s)
@@ -173,8 +174,8 @@ class SearchAgent:
             exprs.append(self._decision(tree, s.owner, armies, s.pending, c, self.cfg.depth + 1))
         values = tree.evaluate(self.evaluator)
         scores = [_resolve(e, values) for e in exprs]
-        best = self._pick(scores)
-        plan, plan_score = [(border[best], n)], scores[best]
+        options = [([(c, n)], q) for c, q in zip(border, scores)]
+        best = int(np.argmax(scores))
         if n >= 4 and len(border) > 1:              # try sharing with the runner-up spots
             order = [i for i in np.argsort(scores)[::-1] if i != best][:4]
             tree = _Tree(s)
@@ -184,15 +185,19 @@ class SearchAgent:
                     armies = s.armies.copy()
                     armies[border[best]] += n - k
                     armies[border[i]] += k
-                    splits.append(((border[best], n - k), (border[i], k),
+                    splits.append(([(border[best], n - k), (border[i], k)],
                                    self._decision(tree, s.owner, armies, s.pending, border[best], self.cfg.depth + 1)))
             if splits:
                 values = tree.evaluate(self.evaluator)
-                split_scores = [_resolve(e, values) for _, _, e in splits]
-                j = int(np.argmax(split_scores))
-                if split_scores[j] > plan_score + 1e-4:
-                    plan = [splits[j][0], splits[j][1]]
-        return plan
+                options += [(plan, _resolve(e, values) - 1e-4) for plan, e in splits]
+        options.sort(key=lambda o: -o[1])
+        return options
+
+    def place(self, s: State, n: int) -> list[tuple[int, int]]:
+        options = self.place_options(s, n)
+        if not options:
+            return []
+        return options[self._pick([q for _, q in options])][0]
 
     def _shortlist(self, s: State, border: list[int], n: int) -> list[int]:
         """Cheap ranking of reinforcement spots when the front is too long to search fully."""
@@ -213,8 +218,8 @@ class SearchAgent:
         return [c for _, c in scored[:self.cfg.max_place]]
 
     # ------------------------------------------------------------------ attacks
-    def choose_attack(self, s: State):
-        """Returns (source, target, "min"|"max") or None to end the attack phase."""
+    def attack_options(self, s: State):
+        """(value of stopping, [(source, target, occupation, value, win probability)] best first)."""
         me = s.me
         tree = _Tree(s)
         stop = tree.leaf(s.owner, s.armies, s.pending)
@@ -225,61 +230,67 @@ class SearchAgent:
                 continue
             for dst in self._targets(s, s.owner, s.armies, src, 99):
                 options.append((src, dst, self._attack(tree, s.owner, s.armies, s.pending, src, dst, self.cfg.depth)))
-        if not options:
-            return None
         values = tree.evaluate(self.evaluator)
-        stop_value = _resolve(stop, values)
-        scores, occupations = [], []
-        for _, _, (p, win_max, win_min, lose) in options:
+        ranked = []
+        for src, dst, (p, win_max, win_min, lose) in options:
             v_max = _resolve(win_max, values)
             v_min = _resolve(win_min, values) if win_min is not None else -1.0
-            scores.append(p * max(v_max, v_min) + (1.0 - p) * _resolve(lose, values))
-            occupations.append("max" if v_max >= v_min else "min")
+            ranked.append((src, dst, "max" if v_max >= v_min else "min",
+                           p * max(v_max, v_min) + (1.0 - p) * _resolve(lose, values), p))
+        ranked.sort(key=lambda o: -o[3])
+        return _resolve(stop, values), ranked
+
+    def choose_attack(self, s: State):
+        """Returns (source, target, "min"|"max") or None to end the attack phase."""
+        stop_value, options = self.attack_options(s)
         # Compared in log-odds: when far ahead (or behind) all probabilities are nearly equal.
         threshold = float(logit(stop_value)) + self.cfg.margin
-        good = [i for i, q in enumerate(scores) if float(logit(q)) > threshold]
+        good = [o for o in options if float(logit(o[3])) > threshold]
         if not good:
             return None
-        i = good[self._pick([scores[i] for i in good])]
-        return options[i][0], options[i][1], occupations[i]
+        return good[self._pick([o[3] for o in good])][:3]
 
     # ------------------------------------------------------------------ fortification
-    def choose_fortify(self, s: State):
-        """Returns (source, destination, armies) or None. One move, between connected own cells."""
+    def fortify_options(self, s: State):
+        """(value of not moving, [(source, destination, armies, value)] best first)."""
         topo, me = s.topo, s.me
         mine = [int(c) for c in s.cells_of(me)]
         movable = [c for c in mine if s.armies[c] >= 2]
-        if not movable or len(mine) < 2:
-            return None
-        comp = _components(s, mine)
-        enemy_near = {c: max((int(s.armies[t]) for t in topo.nbrs[c] if s.owner[t] >= 0 and s.owner[t] != me),
-                             default=0) for c in mine}
-        is_border = {c: any(s.owner[t] != me for t in topo.nbrs[c]) for c in mine}
-        sources = sorted(movable, key=lambda c: (is_border[c], -int(s.armies[c])))[:6]
-        borders = [c for c in mine if is_border[c]]
         tree = _Tree(s)
         stay = tree.leaf(s.owner, s.armies, s.pending)
         moves = []
-        for src in sources:
-            dests = sorted((c for c in borders if c != src and comp[c] == comp[src]),
-                           key=lambda c: (-enemy_near[c], -int(s.armies[c])))[:6]
-            amounts = {int(s.armies[src]) - 1}
-            if is_border[src] and s.armies[src] >= 4:
-                amounts.add((int(s.armies[src]) - 1) // 2)
-            for dst in dests:
-                for nb in amounts:
-                    armies = s.armies.copy()
-                    armies[src] -= nb
-                    armies[dst] += nb
-                    moves.append((src, dst, nb, tree.leaf(s.owner, armies, s.pending)))
+        if movable and len(mine) >= 2:
+            comp = _components(s, mine)
+            enemy_near = {c: max((int(s.armies[t]) for t in topo.nbrs[c] if s.owner[t] >= 0 and s.owner[t] != me),
+                                 default=0) for c in mine}
+            is_border = {c: any(s.owner[t] != me for t in topo.nbrs[c]) for c in mine}
+            sources = sorted(movable, key=lambda c: (is_border[c], -int(s.armies[c])))[:6]
+            borders = [c for c in mine if is_border[c]]
+            for src in sources:
+                dests = sorted((c for c in borders if c != src and comp[c] == comp[src]),
+                               key=lambda c: (-enemy_near[c], -int(s.armies[c])))[:6]
+                amounts = {int(s.armies[src]) - 1}
+                if is_border[src] and s.armies[src] >= 4:
+                    amounts.add((int(s.armies[src]) - 1) // 2)
+                for dst in dests:
+                    for nb in amounts:
+                        armies = s.armies.copy()
+                        armies[src] -= nb
+                        armies[dst] += nb
+                        moves.append((src, dst, nb, tree.leaf(s.owner, armies, s.pending)))
+        values = tree.evaluate(self.evaluator)
+        ranked = sorted(((src, dst, nb, _resolve(e, values)) for src, dst, nb, e in moves), key=lambda m: -m[3])
+        return _resolve(stay, values), ranked
+
+    def choose_fortify(self, s: State):
+        """Returns (source, destination, armies) or None. One move, between connected own cells."""
+        stay_value, moves = self.fortify_options(s)
         if not moves:
             return None
-        values = tree.evaluate(self.evaluator)
-        scores = [_resolve(m[3], values) for m in moves]
-        i = self._pick(scores)
-        if float(logit(scores[i])) <= float(logit(_resolve(stay, values))) + 0.005:
+        move = moves[self._pick([m[3] for m in moves])]
+        if float(logit(move[3])) <= float(logit(stay_value)) + 0.005:
             return None
-        return moves[i][0], moves[i][1], moves[i][2]
+        return move[:3]
 
 
 def _components(s: State, mine: list[int]) -> dict[int, int]:

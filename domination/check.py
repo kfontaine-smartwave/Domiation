@@ -23,7 +23,7 @@ def main():
     if not DEFAULT_IR.exists():
         raise SystemExit(f"{DEFAULT_IR} is missing: run `python -m domination.train` first")
     reference = MLPEvaluator(DEFAULT_WEIGHTS)
-    x = reference.mean + reference.mean.std() * np.random.default_rng(0).standard_normal((1024, N_FEATURES)).astype(np.float32)
+    x = reference.mean + reference.mean.std() * np.random.default_rng(0).standard_normal((1024, reference.n_in)).astype(np.float32)
     expected = reference.logits(x)
     for dev in ("NPU", "GPU", "CPU"):
         try:

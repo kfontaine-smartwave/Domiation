@@ -8,3 +8,4 @@ traces/
 # never commit a seat token
 .env
 token*.txt
+models/value_start.npz

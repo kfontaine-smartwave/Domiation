@@ -160,6 +160,30 @@ class LiveLoopTests(unittest.TestCase):
         self.assertGreater(player.turns, 0)
         self.assertIn("attaque", server.orders)
 
+    def test_games_are_recorded_and_become_training_samples(self):
+        import tempfile
+        from domination.history import load_samples
+        with tempfile.TemporaryDirectory() as folder:
+            server = FakeServer(seed=7)
+            player = Player(server, SearchAgent(LinearEvaluator(), LIGHT), log=lambda *_: None, record_dir=folder)
+            result = player.run()
+            player.trace.close()
+            x, y = load_samples(folder, log=None)
+            self.assertGreaterEqual(len(x), player.turns)
+            self.assertEqual(x.shape[1], N_FEATURES)
+            self.assertTrue(set(np.unique(y)) <= {0.0, 0.5, 1.0})
+            if result == "WON":                         # my own end-of-turn positions are labelled as wins
+                self.assertGreater(y.sum(), 0)
+
+    def test_simulation_agent_plays_a_game(self):
+        from domination.rollout import RolloutAgent, RolloutConfig
+        server = FakeServer(seed=4)
+        server.game.turn_max = 6
+        agent = RolloutAgent(LinearEvaluator(), LIGHT, rollout=RolloutConfig(sims=6))
+        player = Player(server, agent, log=lambda *_: None)
+        self.assertIn(player.run(), ("WON", "lost", "draw"))
+        self.assertGreater(agent.decisions[0], 0)
+
     def test_view_parsing(self):
         server = FakeServer(seed=2)
         s = state_from_view(server.view())

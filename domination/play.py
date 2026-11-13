@@ -6,6 +6,9 @@ The token comes from the game lobby (seat set to "Mon script Python" / "Script e
 also be given through the IA_JETON environment variable so that it stays out of the shell history.
 The agent waits for its turn, plays it order by order (it re-reads the board after every battle)
 and stops by itself when the game is over or when the token is revoked.
+
+Every game is recorded in traces/ (positions and final result); `python -m domination.train`
+adds those real positions to its training set and `python -m domination.history` lists them.
 """
 from __future__ import annotations
 
@@ -22,17 +25,40 @@ from .board import state_from_view
 from .client import DEFAULT_URL, ApiError, Client
 from .evaluators import load_best_evaluator, sigmoid
 from .features import extract
+from .history import TRACE_DIR
 from .policy import SearchAgent, SearchConfig
+from .rollout import RolloutAgent, RolloutConfig
 
 SAFETY_SECONDS = 15        # stop attacking when the turn clock gets this low
 
 
 class Player:
-    def __init__(self, client: Client, agent: SearchAgent, log=print, trace=None):
-        self.client, self.agent, self.log, self.trace = client, agent, log, trace
+    def __init__(self, client: Client, agent: SearchAgent, log=print, record_dir=None, think: float = 45.0):
+        self.client, self.agent, self.log = client, agent, log
+        self.record_dir, self.think = record_dir, think
+        self.trace = None
         self.topo = None
         self.turns = 0
         self.deployed = False
+
+    def _record(self, view: dict, order=None):
+        """Appends a server reply to the recording of this game (the journal is left out, except
+        its last lines at the end of the game: positions and the result are what training needs)."""
+        if self.record_dir is None:
+            return
+        try:
+            game = view["partie"]
+            if self.trace is None:
+                os.makedirs(self.record_dir, exist_ok=True)
+                name = f"{game.get('id') or 'game'}_{view.get('vous', 'x')}.jsonl".replace("/", "-").replace(":", "-")
+                self.trace = open(os.path.join(self.record_dir, name), "a", encoding="utf-8")
+            keep = 30 if game.get("termine") else 1
+            slim = dict(view, partie=dict(game, journal=(game.get("journal") or [])[-keep:]))
+            self.trace.write(json.dumps({"t": time.time(), "order": order, "view": slim}, ensure_ascii=False) + "\n")
+            self.trace.flush()
+        except (OSError, KeyError, TypeError) as exc:
+            self.log(f"  recording stopped ({exc})")
+            self.record_dir = None
 
     # ------------------------------------------------------------------ helpers
     def _state(self, view):
@@ -42,9 +68,7 @@ class Player:
 
     def _act(self, action: str, **fields) -> dict:
         view = self.client.act(action, **fields)
-        if self.trace:
-            self.trace.write(json.dumps({"t": time.time(), "order": {"action": action, **fields},
-                                         "view": view}, ensure_ascii=False) + "\n")
+        self._record(view, {"action": action, **fields})
         return view
 
     def _value(self, s) -> float:
@@ -59,6 +83,8 @@ class Player:
         started = time.time()
         budget = float(view.get("delai_restant") or 120)
         notes = {"placed": [], "attacks": 0, "conquests": 0, "fortify": None}
+        if hasattr(self.agent, "begin_turn"):          # thinking time for the simulations
+            self.agent.begin_turn(min(self.think, budget - SAFETY_SECONDS - 15))
         me = view["vous"]
         before = view["partie"]["joueurs"][me]["stats"]["territoires"]
 
@@ -174,6 +200,7 @@ class Player:
                 failures = 0
                 game = view["partie"]
                 if game["termine"]:
+                    self._record(view)
                     winner = game.get("vainqueur")
                     name = game["joueurs"][winner]["nom"] if winner else "nobody (draw)"
                     result = "WON" if winner == view["vous"] else ("draw" if not winner else "lost")
@@ -185,6 +212,7 @@ class Player:
                 if not view.get("mon_tour"):
                     continue
                 turn = game["tour"]
+                self._record(view)
                 notes = self.play_turn(view)
             except ApiError as exc:
                 if exc.fatal:
@@ -205,6 +233,9 @@ class Player:
             usage = f" | {ev.device}: {ev.positions} positions, {ev.seconds:.2f} s" if hasattr(ev, "positions") else ""
             if hasattr(ev, "positions"):
                 ev.positions, ev.seconds = 0, 0.0
+            if hasattr(self.agent, "sims_run"):
+                usage += f" | {self.agent.sims_run} simulations"
+                self.agent.sims_run = 0
             self.log(f"turn {turn}: {', '.join(notes['placed']) or 'no reinforcement'}; "
                      f"{notes['attacks']} attacks, {notes['conquests']} conquests; "
                      f"fortify {notes['fortify'] or '-'} | territories {notes['before']} -> {notes['after']} | "
@@ -231,22 +262,34 @@ def main(argv=None):
     ap.add_argument("--device", default="NPU", help="OpenVINO device for the value network (NPU, GPU, CPU)")
     ap.add_argument("--tours", "--turns", dest="turns", type=int, default=None, help="stop after N turns")
     ap.add_argument("--depth", type=int, default=2, help="conquest chains explored after each attack")
-    ap.add_argument("--trace", help="write every order and server reply to this JSONL file")
+    ap.add_argument("--lookahead", action="store_true",
+                    help="experimental: also simulate the opponents' replies before deciding "
+                         "(measured: no gain with the current network, so it is off by default)")
+    ap.add_argument("--sims", type=int, default=0,
+                    help="with --lookahead: dice simulations per decision (0 = one noise-free simulation per option)")
+    ap.add_argument("--think", type=float, default=45.0, help="with --lookahead: seconds of simulations per turn")
+    ap.add_argument("--record-dir", default=str(TRACE_DIR), help="where games are recorded")
+    ap.add_argument("--no-record", action="store_true", help="do not record the game")
     a = ap.parse_args(argv)
     if not a.token:
         ap.error("missing token: --jeton <token> or environment variable IA_JETON")
     evaluator = load_best_evaluator(a.device)
     print(f"Evaluator: {evaluator.name}")
-    agent = SearchAgent(evaluator, SearchConfig(depth=a.depth))
-    trace = open(a.trace, "a", encoding="utf-8") if a.trace else None
+    if a.lookahead:
+        agent = RolloutAgent(evaluator, SearchConfig(depth=a.depth), rollout=RolloutConfig(sims=a.sims))
+        print(f"Search: with simulated look-ahead, up to {a.think:.0f} s per turn")
+    else:
+        agent = SearchAgent(evaluator, SearchConfig(depth=a.depth))
+    player = Player(Client(a.url, a.token), agent, record_dir=None if a.no_record else a.record_dir, think=a.think)
     print("Connected. Waiting for my turn...")
     try:
-        Player(Client(a.url, a.token), agent, trace=trace).run(a.turns)
+        player.run(a.turns)
     except KeyboardInterrupt:
         print("Interrupted.")
     finally:
-        if trace:
-            trace.close()
+        if player.trace:
+            player.trace.close()
+            print(f"Game recorded in {player.trace.name}")
 
 
 if __name__ == "__main__":
